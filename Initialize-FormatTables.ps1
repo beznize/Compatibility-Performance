@@ -1,9 +1,11 @@
 [CmdletBinding()]
-param([string] $FromCheckout)
+param([string] $FromCheckout, [string] $Directory)
 
 $ErrorActionPreference = 'Stop'
 $relativePath = 'crates/victory-formats/src/bcpack-tables.bin'
-$destination = Join-Path $PSScriptRoot $relativePath
+$destination = if ($Directory) {
+    Join-Path ([IO.Path]::GetFullPath($Directory)) 'bcpack-tables.bin'
+} else { Join-Path $PSScriptRoot $relativePath }
 $expectedHash = '1F1D4760419202BB5672F0C428CE51E456B5D08FBAEC8F371D043FD94E01C36B'
 $sourceUrl = "https://raw.githubusercontent.com/Marvisak/VIctory/2849477415a46f5a079c85cf3e64a3dff32f713c/$relativePath"
 

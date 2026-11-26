@@ -1385,11 +1385,16 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    if filled < FLOOR {
-        return true;
-    }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        Some([budget, used, shared, shared_used]) => {
+            // This pass speculatively stages bindless views. At the shared
+            // memory limit even allocating a command list or an upload can
+            // fail while there is still room in local VRAM. Leave room for
+            // the title's active draw resources and the transfer buffers.
+            let reserve = (shared / 8).min(1 << 30);
+            (shared == 0 || shared.saturating_sub(shared_used) > reserve)
+                && (filled < FLOOR || used < budget / 100 * room_percent())
+        }
         None => filled < WITHOUT_BUDGET,
     }
 }

@@ -195,8 +195,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if !covered_pages(&j.ahead, first, last) && ask_kernel(j, first, last) {
+            remember_pages(&mut j.ahead, first, last);
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -227,6 +227,40 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// The journal keeps the exact union of pages sampled in this generation.
+fn covered_pages(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let pos = ranges.partition_point(|&(_, end)| end <= first);
+    ranges.get(pos).is_some_and(|&(start, end)| start <= first && last <= end)
+}
+
+fn remember_pages(ranges: &mut Vec<(usize, usize)>, first: usize, last: usize) {
+    if first >= last { return; }
+    let lo = ranges.partition_point(|&(_, end)| end < first);
+    let hi = lo + ranges[lo..].partition_point(|&(start, _)| start <= last);
+    if lo == hi {
+        ranges.insert(lo, (first, last));
+    } else {
+        ranges[lo] = (first.min(ranges[lo].0), last.max(ranges[hi - 1].1));
+        ranges.drain(lo + 1..hi);
+    }
+}
+
+#[cfg(test)]
+mod sampled_page_tests {
+    #[test]
+    fn adjacent_queries_cover_their_union_and_holes_still_reach_the_kernel() {
+        let mut pages = vec![];
+        for (a,b) in [(30,40), (15,20), (6,10), (10,15), (12,17), (25,30)] {
+            super::remember_pages(&mut pages, a,b);
+        }
+        assert_eq!(pages, [(6,20), (25,40)]);
+        assert!(super::covered_pages(&pages, 7, 20));
+        assert!(!super::covered_pages(&pages, 19, 26));
+        super::remember_pages(&mut pages, 20,25);
+        assert!(super::covered_pages(&pages, 6,40));
+    }
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -237,7 +271,7 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel(j, first, last) {
-        j.ahead.push((first, last));
+        remember_pages(&mut j.ahead, first, last);
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
@@ -293,9 +327,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    covered_pages(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -311,7 +343,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if covered_pages(&j.ahead, first, last) {
         return Some((
             j.ahead_asked,
             j.written

@@ -65,6 +65,7 @@ translation_inputs! {
     "emit/mod.rs",
     "emit/own_bits.rs",
     "emit/packed_mask.rs",
+    "emit/raw_memory.rs",
     "emit/rect.rs",
     "emit/sampler.rs",
     "emit/shader.rs",

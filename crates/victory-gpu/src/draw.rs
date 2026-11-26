@@ -1843,7 +1843,7 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
+        let mut room = crate::resource::room();
         host.set_texture_pressure(!room);
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
@@ -1926,9 +1926,16 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        let mut last_budget_check = SPENT.load(Ordering::Relaxed);
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            let spent = SPENT.load(Ordering::Relaxed);
+            if spent >= bytes_at_most || began.elapsed() > span {
                 break;
+            }
+            if room && spent.saturating_sub(last_budget_check) >= 32 << 20 {
+                room = crate::resource::room();
+                host.set_texture_pressure(!room);
+                last_budget_check = spent;
             }
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands

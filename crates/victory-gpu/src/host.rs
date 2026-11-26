@@ -1843,6 +1843,7 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    declared: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Last writer copied to each placed texture on this list. The state
@@ -1901,6 +1902,7 @@ impl RawCopyCoverage {
 impl Deferred {
     fn invalidate_refreshes(&mut self) {
         self.refreshed.clear();
+        self.declared.clear();
         self.raw_copies.read = 0;
     }
 
@@ -5734,9 +5736,11 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.declared.insert(key) {
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -6240,8 +6244,8 @@ fn wide_refresh() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
+/// A submission's refreshes not done yet, merged per buffer copy only
+/// where their byte ranges overlap or touch, before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
@@ -6250,7 +6254,7 @@ fn wide_refresh() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, RefreshRanges)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -6260,18 +6264,59 @@ struct Batch {
     textures: std::collections::HashSet<usize>,
 }
 
+/// Usually there is just one span. Keep that case allocation-free.
+struct RefreshRanges {
+    first: (usize, usize),
+    others: Vec<(usize, usize)>,
+}
+
+#[cfg(test)]
+mod refresh_range_tests {
+    use super::RefreshRanges;
+
+    #[test]
+    fn submission_refresh_preserves_the_hole_between_disjoint_views() {
+        let mut spans = RefreshRanges { first: (16, 32), others: Vec::new() };
+        for (a,b) in [(1 << 24, (1 << 24) + 128), (32,48), (0,16), ((1 << 24) + 1, (1 << 24) + 32)] {
+            spans.add(a,b);
+        }
+        spans.normalize();
+        assert_eq!(spans.ranges().collect::<Vec<_>>(), [(0,48), (1 << 24,(1 << 24) + 128)]);
+    }
+}
+
+impl RefreshRanges {
+    fn add(&mut self, a: usize, b: usize) {
+        if a <= self.first.1 && self.first.0 <= b {
+            self.first = (self.first.0.min(a), self.first.1.max(b));
+        } else {
+            self.others.push((a, b));
+        }
+    }
+
+    fn normalize(&mut self) {
+        if !self.others.is_empty() {
+            join_ranges(&mut self.others, [self.first]);
+            self.first = self.others.remove(0);
+        }
+    }
+
+    fn ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        std::iter::once(self.first).chain(self.others.iter().copied())
+    }
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                self.refreshes[at].1.add(address, end);
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), RefreshRanges { first: (address, end), others: Vec::new() }));
             }
         }
     }
@@ -6282,12 +6327,15 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, mut ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        ranges.normalize();
+        for (from, to) in ranges.ranges() {
+            Self::update(&shadow, from, to);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6316,6 +6364,7 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
+        for (_, ranges) in &mut self.refreshes { ranges.normalize(); }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;
@@ -6325,7 +6374,7 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.ranges())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6339,14 +6388,16 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, ranges)| Box::new(move || {
+                    for (from, to) in ranges.ranges() { Self::update(&shadow, from, to); }
+                }) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, ranges) in self.refreshes.drain(..) {
+                for (from, to) in ranges.ranges() { Self::update(&shadow, from, to); }
             }
         }
         if ahead {
