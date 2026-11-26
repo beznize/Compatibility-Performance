@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 pub const ROOT_MARKER: &str = ".victory-root";
 
 /// The source tree this binary was compiled from.
+#[cfg(test)]
 fn compiled_workspace_root() -> PathBuf {
     // crates/victory-core -> workspace root
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
@@ -34,22 +35,11 @@ pub enum PolicyError {
 
 /// Returns `Ok` only if `path` is outside every VIctory source tree.
 ///
-/// `path` does not have to exist yet. Two checks are made:
-/// 1. it is not below the source tree this binary was built from;
-/// 2. none of its ancestors contains the [`ROOT_MARKER`] file (catches
-///    other clones/copies of the repository).
+/// Canonicalize the existing prefix and check each ancestor for
+/// [`ROOT_MARKER`]. This covers the build checkout and other clones even
+/// when the final directory does not yet exist.
 pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
     let resolved = resolve(path)?;
-
-    if let Ok(root) = std::fs::canonicalize(compiled_workspace_root())
-        && root.join(ROOT_MARKER).is_file()
-        && resolved.starts_with(&root)
-    {
-        return Err(PolicyError::InsideRepo {
-            path: path.to_path_buf(),
-            root,
-        });
-    }
 
     for ancestor in resolved.ancestors() {
         if ancestor.join(ROOT_MARKER).is_file() {

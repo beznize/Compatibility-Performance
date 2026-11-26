@@ -17,6 +17,14 @@ use victory_shader::{io, resource};
 
 use crate::shader::{MAX_FILE, Source, sources};
 
+/// A private title directory can link individual archives. Inspect the
+/// link target's type and size without recursing into linked directories.
+fn scan_file(entry: &walkdir::DirEntry) -> bool {
+    let kind = entry.file_type();
+    if !kind.is_file() && !kind.is_symlink() { return false; }
+    std::fs::metadata(entry.path()).is_ok_and(|file| file.is_file() && file.len() <= MAX_FILE)
+}
+
 #[derive(Default)]
 struct Tally {
     containers: usize,
@@ -193,7 +201,7 @@ pub fn run(
             .into_iter()
             .filter_map(Result::ok)
         {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+            if !scan_file(&entry) {
                 continue;
             }
             let Ok(data) = std::fs::read(entry.path()) else {
@@ -317,7 +325,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let started = std::time::Instant::now();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+            if !scan_file(&entry) {
                 continue;
             }
             let Ok(data) = std::fs::read(entry.path()) else {
