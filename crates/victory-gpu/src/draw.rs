@@ -249,14 +249,14 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, slot count, contents) → first
+    /// Tables made afresh in this list: (table, slot count, contents) Ã¢â€ â€™ first
     /// dynamic slot and the buffer ownership generation last checked.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, u64)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
-    /// address; 0 for none) → current buffer owner and its dynamic slot.
+    /// address; 0 for none) Ã¢â€ â€™ current buffer owner and its dynamic slot.
     /// Earlier bindings keep their own slots until this list finishes.
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
@@ -2196,6 +2196,7 @@ impl State {
             }
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::command(self.pipeline as This, Some(list), "dispatch: explicit skip", false);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
@@ -2206,6 +2207,7 @@ impl State {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
                 self.list_dropped_roots([x, y, z]);
             }
+            crate::pipeline::command(self.pipeline as This, Some(list), "dispatch: builder group unavailable", false);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -2222,10 +2224,12 @@ impl State {
                 crate::pipeline::note_drop(self.pipeline as This);
                 self.list_dropped_roots([x, y, z]);
             }
+            crate::pipeline::command(self.pipeline as This, Some(list), "dispatch: no compute PSO", false);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            crate::pipeline::command(self.pipeline as This, Some(list), "dispatch: wrong pipeline type", false);
             return;
         }
         if !self.bind(list, p, true) {
@@ -2235,6 +2239,7 @@ impl State {
             if builder {
                 crate::pipeline::builder_off("one of its dispatches could not be bound");
             }
+            crate::pipeline::command(self.pipeline as This, Some(list), "dispatch: resource binding failed", false);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -2284,6 +2289,7 @@ impl State {
                 unsafe { list.list.Dispatch(x, y, z) };
             }
         }
+        crate::pipeline::command(self.pipeline as This, Some(list), "dispatch", true);
         if let Some((param, word, _)) = tail {
             // Later ordinary or indirect dispatches use all lanes.
             unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
@@ -2609,6 +2615,7 @@ impl State {
                 }
                 Err(_) => false,
             };
+        crate::pipeline::command(self.pipeline as This, Some(list), "mesh", ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -3019,6 +3026,7 @@ impl State {
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        crate::pipeline::command(self.pipeline as This, Some(list), "draw", ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -3123,6 +3131,7 @@ impl State {
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        crate::pipeline::command(self.pipeline as This, Some(list), "indexed", ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -3133,6 +3142,7 @@ impl State {
 
 impl State {
     pub(crate) fn invalid_indirect(&self) {
+        crate::pipeline::command(self.pipeline as This, None, "indirect: invalid arguments or signature", false);
         if crate::pipeline::is_builder(self.pipeline as This) {
             crate::pipeline::builder_off("invalid builder indirect signature or argument buffer");
         }
@@ -3152,6 +3162,8 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        let name = match kind { 0 => "indirect draw", 1 => "indirect indexed", 2 => "indirect dispatch", 10 => "indirect mesh", _ => "indirect unsupported kind" };
+        crate::pipeline::command(self.pipeline as This, Some(list), name, ran);
         if kind == 2 && max != 0 && crate::pipeline::is_builder(self.pipeline as This) {
             if !ran {
                 crate::pipeline::builder_off("an indirect builder dispatch could not run");

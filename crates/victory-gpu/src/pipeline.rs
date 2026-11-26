@@ -41,6 +41,10 @@ pub(crate) struct Bytecode {
     size: usize,
 }
 
+#[cfg(windows)]
+pub(crate) type GraphicsHead = windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+
+#[cfg(not(windows))]
 #[repr(C)]
 pub(crate) struct GraphicsHead {
     root: This,
@@ -60,6 +64,8 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg(windows)]
+    identity: blake3::Hash,
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
@@ -71,8 +77,9 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+/// A shader binding has a stage as well as a container identity.
+type ShaderTable = HashMap<(&'static str, [u8; 32]), Arc<Shader>>;
+static SHADERS: Mutex<Option<ShaderTable>> = Mutex::new(None);
 
 /// For the memory lines: containers kept and their bytes, translations
 /// kept and the bytes of their host code. None of them is ever let go.
@@ -103,12 +110,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry((stage, *full.as_bytes()))
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Arc::new(Shader {
                 stage,
+                #[cfg(windows)]
+                identity: full,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
@@ -128,12 +137,13 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
     // Not through the table, which lets nothing go.
     let shader = Arc::new(Shader {
         stage,
+        identity: full,
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
         translated: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
-    let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
+    let made = compute.then(|| make::warm(make::Pending::new(vec![shader], None), "offline-compute", stage)).flatten();
     (translated, made)
 }
 
@@ -170,6 +180,10 @@ impl Shader {
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                if audit::enabled() {
+                    audit::event("shader", if done.is_ok() { "translated" } else { "rejected" },
+                        &self.identity.to_hex(), done.as_ref().err().map(String::as_str).unwrap_or(self.stage));
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -571,6 +585,7 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 }
 
 fn hand_out(
+    #[cfg_attr(not(windows), allow(unused_variables))] origin: &str,
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
     iid: *const Iid,
@@ -579,6 +594,8 @@ fn hand_out(
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    #[cfg(windows)]
+    host.describe_request("runtime", origin);
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -602,7 +619,15 @@ fn hand_out(
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
-    object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
+    #[cfg(windows)]
+    let audit_host = audit::enabled().then(|| pipeline.host.clone());
+    let hr = object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out);
+    #[cfg(windows)]
+    if let Some(host) = audit_host {
+        audit::event("guest", if hr < 0 { "rejected" } else if out.is_null() { "probe" } else { "issued" },
+            &host.key, format_args!("{origin} HRESULT {hr:#010x}"));
+    }
+    hr
 }
 
 /// Device method.
@@ -614,14 +639,30 @@ pub(crate) extern "system" fn create_graphics(
 ) -> HRESULT {
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
-        return E_INVALIDARG;
+        return invalid_request("graphics", "null description", out);
     };
-    let stages = GRAPHICS_STAGES.iter().zip(&desc.stages);
-    let shaders = stages.filter_map(|(s, c)| copy(s, c)).collect();
+    #[cfg(windows)]
+    let bytecode = [desc.VS, desc.PS, desc.DS, desc.HS, desc.GS].map(|s| Bytecode {
+        code: s.pShaderBytecode.cast(), size: s.BytecodeLength,
+    });
+    #[cfg(windows)]
+    let stages = &bytecode;
+    #[cfg(not(windows))]
+    let stages = &desc.stages;
+    if stages.iter().any(|c| c.code.is_null() != (c.size == 0)) {
+        return invalid_request("graphics", "inconsistent shader pointer and size", out);
+    }
+    let shaders = GRAPHICS_STAGES.iter().zip(stages).filter_map(|(s, c)| copy(s, c)).collect();
+    #[cfg(windows)]
+    let graphics = match unsafe { host::GraphicsState::from_plain(desc) } {
+        Ok(state) => state,
+        Err(why) => return invalid_request("graphics", why, out),
+    };
     hand_out(
+        "graphics",
         shaders,
         #[cfg(windows)]
-        None,
+        Some(graphics),
         iid,
         out,
     )
@@ -636,9 +677,13 @@ pub(crate) extern "system" fn create_compute(
 ) -> HRESULT {
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
-        return E_INVALIDARG;
+        return invalid_request("compute", "null description", out);
     };
+    if desc.stage.code.is_null() || desc.stage.size == 0 {
+        return invalid_request("compute", "missing compute bytecode", out);
+    }
     hand_out(
+        "compute",
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
         None,
@@ -654,11 +699,16 @@ pub(crate) extern "system" fn create_compute(
 pub(crate) extern "system" fn create_compute_x(
     this: This,
     desc: *const ComputeHead,
-    _extensions: u32,
+    extensions: u32,
     _extended: *const u8,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    if extensions != 0 {
+        let why = format!("{extensions} unimplemented compute extensions");
+        audit::event("guest", "unimplemented", "-", &why);
+        return invalid_request("compute_x", &why, out);
+    }
     create_compute(this, desc, iid, out)
 }
 
@@ -698,57 +748,84 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
     }
 }
 
-/// Device method: a pipeline from a stream; the shaders are kept, and the
-/// graphics state for the host pipeline.
-pub(crate) extern "system" fn create_stream(
-    _: This,
-    desc: *const StreamDesc,
-    iid: *const Iid,
-    out: *mut This,
-) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
-    let Some(desc) = (unsafe { desc.as_ref() }) else {
-        return E_INVALIDARG;
-    };
-    if desc.stream.is_null() {
-        return E_INVALIDARG;
-    }
+struct StreamParts {
+    shaders: Vec<Arc<Shader>>,
+    #[cfg(windows)]
+    graphics: Box<host::GraphicsState>,
+}
+
+// The caller owns all memory named by shader and input-layout pointers.
+unsafe fn decode_stream(bytes: &[u8]) -> Result<StreamParts, String> {
     let mut shaders = Vec::new();
     #[cfg(windows)]
-    let mut graphics = host::GraphicsState::default();
+    let mut graphics = Box::new(host::GraphicsState::default());
     let mut at = 0;
-    while at + 8 <= desc.size {
-        // SAFETY: inside the stream the title passes.
-        let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
-        let Some((size, stage)) = subobject(kind) else {
-            tracing::warn!(
-                kind,
-                at,
-                "pipeline subobject of unknown size; the rest is ignored"
-            );
-            break;
-        };
+    while at < bytes.len() {
+        let tail = &bytes[at..];
+        let header = tail.get(..4).ok_or_else(|| format!("truncated type at {at}"))?;
+        let kind = u32::from_le_bytes(header.try_into().expect("four bytes"));
+        let (size, stage) = subobject(kind).ok_or_else(|| format!("unknown stream subobject {kind} at {at}"))?;
+        let object = tail.get(..size).ok_or_else(|| format!("truncated stream subobject {kind} at {at}"))?;
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: the full shader subobject was checked above.
+            let code = unsafe { object.as_ptr().add(8).cast::<Bytecode>().read_unaligned() };
+            if code.code.is_null() != (code.size == 0) {
+                return Err(format!("inconsistent {stage} bytecode pointer and size at {at}"));
+            }
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
-        unsafe {
-            graphics.read(kind, desc.stream.add(at))
-        };
+        // SAFETY: the whole subobject was checked; the caller owns its nested data.
+        unsafe { graphics.read(kind, object.as_ptr()) };
         at += size;
     }
     #[cfg(windows)]
     graphics.apply_integer_blend_bypass();
-    hand_out(
-        shaders,
-        #[cfg(windows)]
-        Some(Box::new(graphics)),
-        iid,
-        out,
-    )
+    Ok(StreamParts { shaders, #[cfg(windows)] graphics })
+}
+
+fn invalid_request(origin: &str, why: &str, out: *mut This) -> HRESULT {
+    audit::event("guest", "rejected", "-", format_args!("{origin}: {why}"));
+    tracing::warn!(origin, why, "pipeline description rejected");
+    if !out.is_null() {
+        // SAFETY: the device caller supplied an output slot.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    E_INVALIDARG
+}
+
+/// Device method for the console pipeline-state stream.
+pub(crate) extern "system" fn create_stream(
+    _: This, desc: *const StreamDesc, iid: *const Iid, out: *mut This,
+) -> HRESULT {
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return invalid_request("stream", "null description", out);
+    };
+    if desc.stream.is_null() || desc.size == 0 || desc.size > isize::MAX as usize {
+        return invalid_request("stream", "invalid stream extent", out);
+    }
+    // SAFETY: the device caller owns the stream and its nested data for this call.
+    match unsafe { decode_stream(std::slice::from_raw_parts(desc.stream, desc.size)) } {
+        Ok(parts) => hand_out("stream", parts.shaders, #[cfg(windows)] Some(parts.graphics), iid, out),
+        Err(why) => invalid_request("stream", &why, out),
+    }
+}
+
+/// Precompile one archived graphics description through the runtime's stream decoder.
+///
+/// # Safety
+/// Every shader and input-layout pointer inside the stream must reference valid memory
+/// until this call returns, as guaranteed by the shader-pack stream builder.
+#[cfg(windows)]
+pub unsafe fn warm_graphics(stream: &[u8], record: u64) -> bool {
+    match unsafe { decode_stream(stream) } {
+        Ok(parts) => make::warm(make::Pending::new(parts.shaders, Some(parts.graphics)),
+            "offline-graphics", format_args!("{record:016x}")).unwrap_or(false),
+        Err(why) => {
+            audit::event("offline-graphics", "rejected", "-", format_args!("{record:016x} {why}"));
+            false
+        }
+    }
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -770,6 +847,16 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+pub mod audit;
+
+#[cfg(windows)]
+pub(crate) fn command(this: This, list: Option<&crate::host::HostList>, kind: &str, recorded: bool) {
+    if !audit::enabled() { return; }
+    let key = if this.is_null() { "-" } else { &pipeline(this).host.key };
+    if recorded && let Some(list) = list { list.audit_recorded(key); }
+    audit::event("command", if recorded { "recorded" } else { "missing" }, key, kind);
+}
+
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
@@ -800,6 +887,7 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+    audit::flush();
 }
 
 #[cfg(test)]
@@ -826,12 +914,35 @@ mod tests {
     }
 
     #[test]
+    fn stream_rejects_unknown_and_truncated_subobjects_without_publishing_a_pipeline() {
+        for bytes in [&1u32.to_le_bytes()[..], &777u32.to_le_bytes(), &[0; 3]] {
+            let desc = StreamDesc { size: bytes.len(), stream: bytes.as_ptr() };
+            let mut result = std::ptr::dangling();
+            assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut result), E_INVALIDARG);
+            assert!(result.is_null());
+        }
+        assert!(!Arc::ptr_eq(&shader("pixel", &[47]), &shader("vertex", &[47])));
+    }
+
+    #[test]
     fn pipelines_keep_their_shaders() {
         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
+        #[cfg(not(windows))]
         let none = || Bytecode {
             code: std::ptr::null(),
             size: 0,
         };
+        #[cfg(windows)]
+        let desc = {
+            use windows::Win32::Graphics::Direct3D12::*;
+            GraphicsHead {
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr().cast(), BytecodeLength: vs.len() },
+                PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr().cast(), BytecodeLength: ps.len() },
+                SampleMask: 0x7fff_ffff, PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                ..Default::default()
+            }
+        };
+        #[cfg(not(windows))]
         let desc = GraphicsHead {
             root: std::ptr::null(),
             stages: [
@@ -857,6 +968,8 @@ mod tests {
             shaders(p),
             [("vertex", vs.to_vec()), ("pixel", ps.to_vec())]
         );
+        #[cfg(windows)]
+        assert_eq!(pipeline(p).host.graphics.as_ref().unwrap().topology, desc.PrimitiveTopologyType);
         // A second pipeline with the same pixel shader shares its container.
         let mut q = std::ptr::null();
         create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);

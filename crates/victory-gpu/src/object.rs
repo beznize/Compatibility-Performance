@@ -293,6 +293,7 @@ static REPORTED: [[AtomicBool; MAX_SLOTS]; KINDS.len()] =
 /// image for title calls). Wrong for a slot that returns a value instead of
 /// an `HRESULT`.
 extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
+    crate::pipeline::audit::event("method", "unimplemented", KINDS[KIND], format_args!("slot {:#x}", SLOT * 8));
     if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
         tracing::warn!(
             object = KINDS[KIND],

@@ -527,6 +527,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
             None => {}
         }
     }
+    crate::pipeline::audit::event("device", "failed", "-", &text);
+    crate::pipeline::audit::flush();
     tracing::error!("{text}");
     // Tests have no log: the reason goes to their output.
     #[cfg(test)]
@@ -1829,6 +1831,7 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    audit_commands: std::collections::HashMap<String, u64>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     /// First of the contiguous fills at the end of `copies`.
@@ -2775,6 +2778,7 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                crate::pipeline::audit::completed(completed);
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -4733,6 +4737,10 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            if crate::pipeline::audit::enabled() {
+                for list in runs { list.audit_submitted(*submitted); }
+                crate::pipeline::audit::completed(unsafe { self.fence.GetCompletedValue() });
+            }
             self.return_preludes(*submitted, preludes);
             let back = declared_writes(runs);
             let mut texture_writes = Vec::new();
@@ -4782,8 +4790,13 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
+                        if crate::pipeline::audit::enabled() {
+                            if groups.len() == 1 { for list in runs { list.audit_submitted(*submitted); } }
+                            else { runs[i].audit_submitted(*submitted); }
+                        }
                         working(false);
                         WaitForSingleObject(self.event, INFINITE);
+                        if crate::pipeline::audit::enabled() { crate::pipeline::audit::completed(self.fence.GetCompletedValue()); }
                         stood(started);
                         working(true);
                     }
@@ -5674,6 +5687,18 @@ impl HostList {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
+        }
+    }
+
+    pub(crate) fn audit_recorded(&self, key: &str) {
+        let mut state = self.deferred();
+        if let Some(count) = state.audit_commands.get_mut(key) { *count += 1; }
+        else { state.audit_commands.insert(key.to_owned(), 1); }
+    }
+
+    fn audit_submitted(&self, fence: u64) {
+        for (key, count) in &self.deferred().audit_commands {
+            crate::pipeline::audit::event("queue", "submitted", key, format_args!("{fence} {count}"));
         }
     }
 

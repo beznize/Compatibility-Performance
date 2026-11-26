@@ -38,12 +38,20 @@ impl Source<'_> {
 /// The packed records of SGD5 data, and every container stored as is (the
 /// executable keeps some records uncompressed), found by its magic.
 pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
+    sources_checked(data, |_, _| {})
+}
+
+pub(crate) fn sources_checked(data: &[u8], mut invalid: impl FnMut(&'static str, usize)) -> Vec<Source<'_>> {
     let mut out: Vec<Source<'_>> = Vec::new();
     if sgd5::is_sgd5(data) {
-        out.extend(sgd5::records(data).map(Source::Packed));
+        out.extend(sgd5::records_checked(data, |at| invalid("invalid_packed_signature", at)).map(Source::Packed));
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
+        .filter(|&offset| {
+            let valid = Container::parse(&data[offset..]).is_ok();
+            if !valid { invalid("invalid_signature", offset); }
+            valid
+        })
         .map(|offset| Source::Raw {
             offset,
             data: &data[offset..],

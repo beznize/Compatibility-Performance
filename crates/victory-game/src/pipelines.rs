@@ -675,7 +675,7 @@ pub fn stream<'a>(
         .get(&g.rasterizer_hash)
         .ok_or(Unnamed::Rasterizer)?;
     let blend = named.blend.get(&g.blend_hash).ok_or(Unnamed::Blend)?;
-    let (Some(formats), Some((depth_format, _, topology)), Some((_, count, quality)), Some(inputs)) = (
+    let (Some(formats), Some((depth_format, _, topology)), Some((mask, count, quality)), Some(inputs)) = (
         g.target_formats(),
         g.depth_targets_topology(),
         g.samples(),
@@ -712,7 +712,7 @@ pub fn stream<'a>(
         put64(&mut s, 0x38, ps.len() as u64);
     }
     s[0x8c..0x1d4].copy_from_slice(&blend_desc(blend));
-    put(&mut s, 0x1dc, u32::MAX);
+    put(&mut s, 0x1dc, mask);
     s[0x1e4..0x210].copy_from_slice(&rasterizer_desc(raster));
     s[0x214..0x24c].copy_from_slice(&depth_stencil_desc(depth));
     // The engine makes 1 to 16 samples, a power of two; 21 records store
@@ -836,7 +836,7 @@ mod tests {
     fn metadata() -> Vec<u8> {
         let mut m = vec![0; 0x4c];
         m[0x10..0x18].copy_from_slice(&[28, 0, 10, 0, 0, 0, 0, 0]);
-        m[0x1c..0x20].copy_from_slice(&u32::MAX.to_le_bytes());
+        m[0x1c..0x20].copy_from_slice(&0xa5a5_5a5au32.to_le_bytes());
         m[0x24..0x27].copy_from_slice(&[40, 3, 3]);
         m[0x28] = 2;
         let mut layout = 2u32.to_le_bytes().to_vec();
@@ -891,7 +891,7 @@ mod tests {
         assert_eq!((w(0x10), q(0x18), q(0x20)), (1, vs.as_ptr() as u64, 12));
         assert_eq!((w(0x28), q(0x30), q(0x38)), (2, ps.as_ptr() as u64, 20));
         assert_eq!(b[0x8c..0x1d4], blend_desc(&blend));
-        assert_eq!(w(0x1dc), u32::MAX);
+        assert_eq!(w(0x1dc), 0xa5a5_5a5a);
         assert_eq!(b[0x1e4..0x210], rasterizer_desc(&named.raster[&2]));
         assert_eq!(
             (w(0x210), b[0x214..0x24c].to_vec()),

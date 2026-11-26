@@ -305,52 +305,71 @@ impl<'a> Pack<'a> {
 /// run of zlib streams (each starting at a multiple of 16 bytes and
 /// inflating to at most 64 KiB), found by its magic.
 pub fn find(file: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
-    if file.starts_with(MAGIC) {
-        return Some(std::borrow::Cow::Borrowed(file));
-    }
-    let mut chunk = vec![0u8; 0x20000];
-    // One zlib stream at `at`: its output and the bytes it took.
+    find_all(file, |_| {}).into_iter().next().map(|(_, pack)| pack)
+}
+
+fn pack_size(header: &[u8]) -> Option<usize> {
+    let n = |o| u32_at(header, o).map(|n| n as usize);
+    HEADER.checked_add(n(0x50)?.checked_mul(GRAPHICS)?)?
+        .checked_add(n(0x54)?.checked_mul(COMPUTE)?)?
+        .checked_add(n(0x58)?.checked_add(n(0x5c)?)?.checked_mul(8)?)?
+        .checked_add(n(0x60)?)?.checked_add(n(0x64)?)
+}
+
+/// Find every raw or chunked pack and report the file offsets of malformed candidates.
+pub fn find_all(file: &[u8], mut invalid: impl FnMut(usize)) -> Vec<(usize, std::borrow::Cow<'_, [u8]>)> {
+    use std::borrow::Cow;
+    use zlib_rs::{Inflate, InflateFlush, Status};
+    let mut found = Vec::new();
+    let mut encoded = Vec::new();
+    let mut chunk = vec![0; 0x20000];
     let mut inflate = |at: usize| {
-        use zlib_rs::{Inflate, InflateFlush, Status};
         let mut stream = Inflate::new(true, 15);
-        let status = stream
-            .decompress(file.get(at..)?, &mut chunk, InflateFlush::NoFlush)
-            .ok()?;
-        (status == Status::StreamEnd).then(|| {
-            (
-                chunk[..stream.total_out() as usize].to_vec(),
-                stream.total_in() as usize,
-            )
-        })
+        let status = stream.decompress(file.get(at..)?, &mut chunk, InflateFlush::NoFlush).ok()?;
+        (status == Status::StreamEnd).then(|| (chunk[..stream.total_out() as usize].to_vec(), stream.total_in() as usize))
     };
-    let zlib = |at: usize| {
-        file[at] == 0x78 && u16::from_be_bytes([file[at], file[at + 1]]).is_multiple_of(31)
-    };
-    let start = (0..file.len().saturating_sub(1))
-        .step_by(16)
-        .filter(|&at| zlib(at))
-        .find_map(|at| {
-            inflate(at)
-                .filter(|(out, _)| out.starts_with(MAGIC))
-                .map(|o| (at, o))
-        })?;
-    let (mut at, (mut pack, used)) = start;
-    at += used;
-    let size = |p: &[u8]| -> Option<usize> {
-        let n = |o: usize| u32_at(p, o).map(|v| v as usize);
-        let tables = n(0x50)? * GRAPHICS + n(0x54)? * COMPUTE + (n(0x58)? + n(0x5c)?) * 8;
-        Some(HEADER + tables + n(0x60)? + n(0x64)?)
-    };
-    loop {
-        // The header gives the size once it is whole.
-        if let Some(total) = size(&pack).filter(|&t| pack.len() >= t) {
-            return (pack.len() == total).then_some(std::borrow::Cow::Owned(pack));
+    // Probe four decoded bytes before spending time on a full block of unrelated data.
+    let mut next = 0;
+    for start in memchr::memchr_iter(0x78, file) {
+        if start < next || start % 16 != 0 || !matches!(file.get(start + 1), Some(0x01 | 0x5e | 0x9c | 0xda)) {
+            continue;
         }
-        at = at.next_multiple_of(16);
-        let (out, used) = inflate(at)?;
-        pack.extend(out);
-        at += used;
+        let mut prefix = [0; 4];
+        let mut probe = Inflate::new(true, 15);
+        if probe.decompress(&file[start..], &mut prefix, InflateFlush::NoFlush).is_err()
+            || probe.total_out() != 4 || &prefix != MAGIC { continue; }
+        let mut at = start;
+        let mut pack = Vec::new();
+        while let Some((part, used)) = inflate(at) {
+            if used == 0 { break; }
+            pack.extend(part);
+            let end = at + used;
+            if let Some(size) = pack_size(&pack) && pack.len() >= size {
+                if pack.len() == size && Pack::parse(&pack).is_ok() {
+                    found.push((start, Cow::Owned(pack)));
+                    encoded.push((start, end));
+                    next = end;
+                }
+                break;
+            }
+            at = end.next_multiple_of(16);
+        }
+        if next <= start { invalid(start); }
     }
+    // Stored zlib blocks can also expose their payload's magic as raw bytes.
+    let mut raw_end = 0;
+    for start in memchr::memmem::find_iter(file, MAGIC) {
+        let after = encoded.partition_point(|&(_, end)| end <= start);
+        if start < raw_end || encoded.get(after).is_some_and(|&(begin, _)| begin <= start) { continue; }
+        let tail = &file[start..];
+        if let Some(pack) = pack_size(tail).and_then(|size| tail.get(..size))
+            && Pack::parse(pack).is_ok() {
+            raw_end = start + pack.len();
+            found.push((start, Cow::Borrowed(pack)));
+        } else { invalid(start); }
+    }
+    found.sort_unstable_by_key(|(start, _)| *start);
+    found
 }
 
 /// The two 12-byte instructions a native program starts with, which carry
@@ -535,6 +554,17 @@ mod tests {
         assert_eq!(find(&archive).as_deref(), Some(&pack[..]));
         assert_eq!(find(&pack).as_deref(), Some(&pack[..]));
         assert!(find(&archive[..archive.len() - 200]).is_none());
+        let mut mixed = archive;
+        mixed.extend(MAGIC);
+        mixed.extend([0xff; HEADER]);
+        let second = mixed.len();
+        mixed.extend(&pack);
+        let mut rejected = Vec::new();
+        let packs = find_all(&mixed, |at| rejected.push(at));
+        assert_eq!(packs.len(), 2);
+        assert_eq!(packs[1].0, second);
+        assert_eq!(packs[1].1.as_ref(), pack);
+        assert!(rejected.contains(&(second - HEADER - 4)));
     }
 
     #[test]

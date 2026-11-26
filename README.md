@@ -4,6 +4,10 @@ DexNom Runtime is a community fork of Marvisak's VIctory for Windows x64. It run
 
 ## Run it on your PC
 
+The Windows x64 prerelease includes the three compiled programs. Extract the ZIP into a writable folder and open `Play-RTX.cmd` to choose your game executable. Run `Play-RTX.cmd -Warm` to build the caches for your installation and GPU. The opening sequence is still unstable on the RTX 4070 SUPER. [Download the Windows x64 prerelease](https://github.com/beznize/Compatibility-Performance/releases) · [RTX benchmark](BENCHMARK.md)
+
+To build and install from source, follow these steps.
+
 1. Use 64-bit Windows and a current Direct3D 12 driver. The game uses mesh shaders and Shader Model 6.6. The Radeon gameplay results and known issues are listed below.
 2. Install Rust for Windows and Visual Studio Build Tools. In the Visual Studio installer, select **Desktop development with C++**, including the x64 MSVC toolset and a Windows 10 or 11 SDK. [Rust installer](https://rustup.rs/) · [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
 3. Download this repository using **Code → Download ZIP**, extract the ZIP to a writable folder, and double-click **Setup.cmd**. Select the Series X game executable inside your own extracted game installation. Keep its accompanying files together. Setup downloads the pinned build dependencies, verifies the BCPack format tables, and compiles the three Windows programs locally. [Download source ZIP](https://github.com/beznize/Compatibility-Performance/archive/refs/heads/main.zip)
@@ -15,13 +19,13 @@ To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** 
 .\Setup.cmd -GamePath "D:\My Games\Series X\game_scarlett_master.exe"
 ```
 
-To warm the shader cache, open `victory-warm.exe` in the installed runtime directory. The log lists translated and refused shaders. Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+The warm-up scans the game directory for shader containers and archived graphics and compute states. Play can request additional combinations of shaders and rendering state. If Windows reports a missing `VCRUNTIME140.dll`, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
 For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together with the verified file from `crates/victory-formats/src/bcpack-tables.bin` outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
 
 ## RTX 4070 SUPER test results
 
-This fork translated all 25,758 shaders found by the archive scanner. The NVIDIA driver accepted 2,728 compute pipelines and rejected six. All 53 acceleration-structure builder pipelines reached the command queue. A 65-texture GPU readback test also preserved every tested value across two heap allocations. Five-minute runs with complete ray tracing still ended early. Missing scene textures, facial lighting and low frame rates remain under investigation. Measurements and test conditions are in [BENCHMARK.md](BENCHMARK.md).
+One opening on the RTX 4070 SUPER requested 83,557 distinct pipeline states. A clean archive pass translated 25,730 of 25,758 recognized shaders with strict wave64 handling. It found 28 compute translation failures, six further compute driver refusals and four graphics driver refusals. The run exited after 205 seconds and measured 0.3 FPS across 12 render-heavy intervals. The benchmark includes the archived graphics inventory, hardware checks and commands for auditing your own run. [RTX pipeline coverage and measurements](BENCHMARK.md#rtx-pipeline-coverage-audit)
 
 ## Try experimental ray tracing
 

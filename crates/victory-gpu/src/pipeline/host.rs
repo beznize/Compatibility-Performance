@@ -129,6 +129,60 @@ impl GraphicsState {
         }
     }
 
+    // The caller keeps every input element and its semantic name alive during this copy.
+    unsafe fn read_layout(&mut self, layout: D3D12_INPUT_LAYOUT_DESC) {
+        if layout.pInputElementDescs.is_null() {
+            return;
+        }
+        let elements = unsafe { std::slice::from_raw_parts(
+            layout.pInputElementDescs,
+            layout.NumElements as usize,
+        ) };
+        self.names = elements
+            .iter()
+            .map(|e| unsafe { CStr::from_ptr(e.SemanticName.0.cast()) }.to_owned())
+            .collect();
+        self.inputs = elements
+            .iter()
+            .zip(&self.names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                Format: DXGI_FORMAT(
+                    crate::resource::pc_format(e.Format.0 as u32) as i32
+                ),
+                ..*e
+            })
+            .collect();
+    }
+
+    fn map_targets(&mut self) {
+        for format in &mut self.targets.RTFormats {
+            format.0 = crate::resource::target_format(crate::resource::pc_format(format.0 as u32)) as i32;
+        }
+    }
+
+    /// The standard fixed description and the stream describe the same D3D12 states.
+    pub(super) unsafe fn from_plain(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Result<Box<Self>, &'static str> {
+        if d.NumRenderTargets > 8 { return Err("more than eight render targets"); }
+        if d.StreamOutput.NumEntries != 0 || d.StreamOutput.NumStrides != 0 {
+            return Err("stream output is unimplemented");
+        }
+        if d.InputLayout.NumElements != 0 && d.InputLayout.pInputElementDescs.is_null() {
+            return Err("null input layout");
+        }
+        let mut state = Box::new(Self {
+            blend: d.BlendState, sample_mask: d.SampleMask, rasterizer: d.RasterizerState,
+            depth: d.DepthStencilState, strip_cut: d.IBStripCutValue, topology: d.PrimitiveTopologyType,
+            targets: D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, RTFormats: d.RTVFormats },
+            depth_format: DXGI_FORMAT(crate::resource::pc_format(d.DSVFormat.0 as u32) as i32),
+            samples: d.SampleDesc, ..Self::default()
+        });
+        unsafe { state.read_layout(d.InputLayout) };
+        state.map_targets();
+        state.apply_integer_blend_bypass();
+        Ok(state)
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -162,28 +216,7 @@ impl GraphicsState {
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
-                    if layout.pInputElementDescs.is_null() {
-                        return;
-                    }
-                    let elements = std::slice::from_raw_parts(
-                        layout.pInputElementDescs,
-                        layout.NumElements as usize,
-                    );
-                    self.names = elements
-                        .iter()
-                        .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
-                        .collect();
-                    self.inputs = elements
-                        .iter()
-                        .zip(&self.names)
-                        .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
-                            SemanticName: PCSTR(name.as_ptr().cast()),
-                            Format: DXGI_FORMAT(
-                                crate::resource::pc_format(e.Format.0 as u32) as i32
-                            ),
-                            ..*e
-                        })
-                        .collect();
+                    self.read_layout(layout);
                 }
                 13 => {
                     self.strip_cut =
@@ -195,11 +228,7 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::target_format(crate::resource::pc_format(
-                            f.0 as u32,
-                        )) as i32;
-                    }
+                    self.map_targets();
                 }
                 16 => {
                     let f = data.cast::<u32>().read_unaligned();
@@ -362,20 +391,20 @@ pub(crate) struct HostPipeline {
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Result<HostPipeline, String> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
         seen.push(reason);
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
-    None
+    Err(reason.to_owned())
 }
 
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
-    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Result<HostPipeline, String> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -407,13 +436,13 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
+        let host = host().ok_or("host D3D12 device unavailable")?;
+        if mesh.is_some() && !host.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            s.translated().ok_or_else(|| format!("{} {} failed translation", s.stage, s.hash))?;
         }
-        let host = host()?;
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -423,7 +452,7 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let t = &shader.translated().ok_or("shader translation missing")?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -493,7 +522,7 @@ impl HostPipeline {
                                 | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
                             OffsetInDescriptorsFromTableStart: 0,
                         }));
-                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last().ok_or("descriptor range missing")?;
                         out.push((slot, params.len() as u32));
                         params.push(D3D12_ROOT_PARAMETER1 {
                             ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
@@ -544,7 +573,7 @@ impl HostPipeline {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
+                return Err(format!("root signature {:#010x}: {}", e.code().0, e.message()));
             }
         };
         let code = |i: usize| {
@@ -576,12 +605,12 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
-                    return None;
+                    return Err(format!("compute PSO {:#010x}: {}", e.code().0, e.message()));
                 }
             };
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
-            return Some(HostPipeline {
+            return Ok(HostPipeline {
                 compute: true,
                 mesh: false,
                 pso,
@@ -629,12 +658,12 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
-                    return None;
+                    return Err(format!("mesh PSO {:#010x}: {}", e.code().0, e.message()));
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
-            return Some(HostPipeline {
+            return Ok(HostPipeline {
                 compute: false,
                 mesh: true,
                 pso,
@@ -655,7 +684,7 @@ impl HostPipeline {
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
             let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
+            let vs = &stages[0].0.translated().ok_or("vertex translation missing")?.host.dxil;
             match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
@@ -735,7 +764,7 @@ impl HostPipeline {
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
-                return None;
+                return Err(format!("graphics PSO {:#010x}: {}", e.code().0, e.message()));
             }
         };
         tracing::info!(?shaders, "host pipeline");
@@ -750,7 +779,7 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
-        Some(HostPipeline {
+        Ok(HostPipeline {
             compute: false,
             mesh: false,
             pso,

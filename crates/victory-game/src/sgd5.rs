@@ -9,7 +9,7 @@
 
 mod database;
 
-pub use database::{Database, Effect, Pass, STAGES, Shader, Technique, databases};
+pub use database::{Database, Effect, Pass, STAGES, Shader, Technique, databases, databases_checked};
 
 pub const MAGIC: &[u8; 4] = b"SGD5";
 const MARKER: [u8; 4] = 0x000D_DCE7_u32.to_le_bytes();
@@ -91,7 +91,16 @@ pub fn is_sgd5(file: &[u8]) -> bool {
 
 /// Every record in an SGD5 file, in file order.
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
-    memchr::memmem::find_iter(file, &MARKER).filter_map(|at| record(file, at))
+    records_checked(file, |_| {})
+}
+
+/// Report invalid marker candidates by offset. A marker alone does not prove
+/// the surrounding bytes form a shader record.
+pub fn records_checked(file: &[u8], mut invalid: impl FnMut(usize)) -> impl Iterator<Item = Record<'_>> {
+    memchr::memmem::find_iter(file, &MARKER).filter_map(move |at| match record(file, at) {
+        Some(record) => Some(record),
+        None => { invalid(at); None }
+    })
 }
 
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {

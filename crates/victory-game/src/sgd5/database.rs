@@ -85,6 +85,11 @@ pub struct Pass<'a> {
 
 /// Every database whose tables parse, in file order.
 pub fn databases(file: &[u8]) -> Vec<Database<'_>> {
+    databases_checked(file, |_| {})
+}
+
+/// Keep searching after a candidate whose declared tables cannot be read.
+pub fn databases_checked(file: &[u8], mut invalid: impl FnMut(usize)) -> Vec<Database<'_>> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(at) = memchr::memmem::find(&file[from..], MAGIC).map(|p| from + p) {
@@ -93,7 +98,7 @@ pub fn databases(file: &[u8]) -> Vec<Database<'_>> {
                 from = db.end;
                 out.push(db);
             }
-            None => from = at + 1,
+            None => { invalid(at); from = at + 1; }
         }
     }
     out

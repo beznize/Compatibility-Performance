@@ -12,6 +12,48 @@ Tests used Windows x64, an RTX 4070 SUPER with 12 GB, a Core i5-12600KF, and 16 
 
 The six remaining driver refusals cover two particle defragmentation pipelines, two effect-building pipelines and two triangle-collection pipelines. The frame-rate numbers above are interval statistics across changing content. The project has no verified same-scene gameplay FPS gain for this GPU.
 
+## RTX pipeline coverage audit
+
+An instrumented opening on the physical RTX 4070 SUPER requested **83,557 distinct pipeline states** and **19,105 distinct shaders**. All of those shaders appeared in the offline inventory. Of the pipeline states, 55,661 were absent from the offline journals used for that comparison. Attachment formats, blending, shader combinations and other draw state contribute to pipeline identity.
+
+| Subsystem | Status | Verified improvement | Next blocker |
+| --- | --- | --- | --- |
+| Offline discovery | Expanded | The scanner opened 109 files totaling 224,001,114,630 bytes. Two shader databases and a packed pipeline table described 25,471 graphics records and 2,693 compute records. | The databases also contain 195 distinct unsupported geometry-stage containers. Other scenes and opaque archive formats remain unmeasured. |
+| Shader translation | Strict wave64 handling | A clean rebuild translated 25,730 of 25,758 recognized vertex, pixel, mesh and compute containers. It exposed 28 compute shaders that previously relied on approximate half-wave operations. | Fourteen divergent reductions, seven cross-half mask exchanges and seven first-active-lane reads require exact lowering. The 195 geometry containers are outside this denominator. |
+| Offline compute | Partial | The RTX driver created 2,700 pipelines. The archive separately identified 2,682 distinct compute containers from 2,693 records. | Six submitted shaders require 64-lane execution on a 32-lane device, 28 failed translation first, and four archived records still lack a matching container. |
+| Archived graphics | Partial | The engine's effect declarations and the native shader signatures in its executable and libraries identify 25,465 of 25,471 records. The updated driver pass created 25,461 of those records. | Six graphics records lack a matching vertex or mesh container. Four additional records blend into RGB9E5. The RTX reports sampling support for this format and lacks native render-target and blend support. Exact ordered blending is outstanding. |
+| Runtime creation and execution | Measured for one opening | Of 83,557 requested states, the runtime recorded host creation for 2,566 and rejection for 18. Commands for 1,683 distinct states were submitted and 1,678 reached a completed fence. | 80,973 requested states had no creation outcome by exit. The command journal recorded 7,716 missing commands across 64 states. A fence confirms queue progress. Pixel values need an independent check. |
+| Faces and animation | Execution traced | An effect-name search associated nine face or mouth states and 83 skin or skeletal states with fence-confirmed work. Zero states in those two sets logged a missing command. | Shader inputs, skeletal poses, morph weights, speech timing and final lighting need a synchronized scene capture. |
+| Lighting, ray tracing and streaming | Partial | Of the name-matched states, 251 lighting or shadow states, 327 ray-tracing or reflection states and 13 streaming-related states reached a completed fence. | Fifteen lighting or shadow states and four ray-tracing or reflection states recorded missing commands. The association with the visible defects remains unverified. |
+| Stability and frame pacing | Opening still unstable | With full RT and a 300-second cutoff, the instrumented process exited at 205.0 seconds. Median reported performance across 12 render-heavy intervals was 0.3 FPS and 3,727 ms/frame. Frame preparation took 2,087 ms, including 1,266 ms in copies. | Shared-buffer allocations failed before the device error. The run provides no verified FPS increase. |
+
+The comparison used the compute warm-up and the 25,450-record graphics precompile recorded for the opening build. The complete runtime journal contained 465,050 ordered events. Subsystem groups use shader and effect names, can overlap and cannot identify a scene's final color or an animation pose. The benchmark harness opened the game's original files read-only and verified the original file manifest after exit.
+
+To record another comparison, give each process its own new audit file. A full warm-up reads the specified directory, translates shaders, and attempts archived graphics and compute states. The report lists requests, compilation results, missing draw or dispatch commands, and completed GPU fences.
+
+~~~powershell
+$env:VICTORY_PIPELINE_AUDIT = "$PWD\offline.tsv"
+.\victory.exe warm $privateGameDir
+$env:VICTORY_PIPELINE_AUDIT = "$PWD\opening.tsv"
+.\Play-RTX.cmd
+Remove-Item Env:\VICTORY_PIPELINE_AUDIT
+.\victory.exe pipeline-report --offline offline.tsv --runtime opening.tsv --details pipeline-coverage.tsv
+~~~
+
+The older prerelease results below used a translator that accepted approximate half-wave operations.
+
+## Windows x64 prerelease verification
+
+The packaged programs were tested on the physical RTX 4070 SUPER with driver 617.42. The archive scan followed the file links in the launcher's private game folder. It translated all 25,758 shaders in 329 seconds and built 2,728 compute pipelines. Six compute pipeline creations still failed. The game opened the resulting 501,630,004-byte driver library at startup. Graphics pipelines that depend on the game's draw state still need a first encounter or a previous run on the same driver.
+
+| Test | Settings and sample | Result |
+| --- | --- | --- |
+| Opening sequence | Full RT requested, parallel preparation, a limit of 32 outstanding lists, and 4 MiB guest-memory windows. The run had a 300-second cutoff. | 0.4 FPS and 2,445.8 ms per frame across 11 render-heavy interval reports, using the median of each metric. The process exited after 200.8 seconds. |
+| Memory and frame pacing | In those intervals, the median time preparing a frame was 1,324.3 ms, including 891.0 ms in copies. Driver pipeline waits were 0.0 ms in the last complete counter report. | Guest-memory windows held 5,928 MiB in the last detailed memory report. Shared-buffer allocations failed and the RT builder subsequently lost a binding. Direct3D 12 eventually reported `E_OUTOFMEMORY` when closing a command list. |
+| Texture and lighting readback | Physical GPU tests covered a packed RGB9E5 texture with two mips and two array slices, and 65 small textures spanning two allocations. | Every tested value matched. The GPU crate recorded 196 passing tests and three ignored tests. The opening captures did not establish that facial lighting, missing materials, or lip sync were repaired. |
+
+The frame reports above include opening and loading transitions. Each qualifying interval averaged at least 500 draws per frame. Frame time is the median of the reported interval means. Individual frame-time percentiles and same-scene gameplay speedup are still unmeasured.
+
 ## Radeon runtime testing, 25 November 2026
 
 ## Experimental RT in Chapter 1 City

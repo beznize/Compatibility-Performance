@@ -380,12 +380,10 @@ pub fn emit(
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
-        // Where the wave operations are the allocation idiom
-        // ([`lower::wave_local`]) that is exact. Other programs are taken
-        // the same way last of all, each half-wave giving its own results
-        // (approximate: a tile-wide result becomes two half-tile ones);
-        // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        // An unproven split can turn a group-wide result into two different
+        // half-wave values. Keep it confined to explicitly requested diagnostics.
+        let strict = !cfg!(feature = "diagnostics")
+            || !std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "approximate");
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {

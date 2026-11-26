@@ -3,8 +3,13 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(windows)]
+mod archive;
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod pack_warm;
+mod pipeline_report;
 mod run;
 mod shader;
 mod translate;
@@ -85,8 +90,7 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
-    /// Translate the shaders of a title's archives into the cache and make
-    /// their compute pipelines, so that a run finds them there.
+    /// Translate archived shaders and compile reconstructible graphics and compute pipelines.
     Warm {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
@@ -95,6 +99,29 @@ enum Command {
         /// Only translate: no host pipelines.
         #[arg(long)]
         no_pipelines: bool,
+        /// Compile the compute containers and omit the archived graphics pass.
+        #[arg(long, conflicts_with = "no_pipelines")]
+        compute_only: bool,
+    },
+    /// Match an archived pipeline pack to the shader database and precompile its graphics states.
+    #[cfg(windows)]
+    PipelinePack {
+        archive: PathBuf,
+        /// Audit shader and state identities without creating driver objects.
+        #[arg(long)]
+        catalog_only: bool,
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+    },
+    /// Compare offline and runtime pipeline journals and report distinct identities and outcomes.
+    PipelineReport {
+        #[arg(long, required = true)]
+        offline: Vec<PathBuf>,
+        #[arg(long, required = true)]
+        runtime: Vec<PathBuf>,
+        /// New TSV with one row for every observed PSO key.
+        #[arg(long)]
+        details: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -174,7 +201,16 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
+        #[cfg(windows)]
+        Command::PipelinePack { archive, catalog_only, jobs } => {
+            let cfg = victory_core::Config::load()?;
+            victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+            pack_warm::run(&archive, catalog_only, jobs)?;
+            if !catalog_only { victory_hle::modules::d3d12x::save_pipeline_cache(); }
+            Ok(())
+        }
+        Command::PipelineReport { offline, runtime, details } => pipeline_report::run(offline, runtime, details),
+        Command::Warm { paths, jobs, no_pipelines, compute_only } => translate::warm(paths, jobs, !no_pipelines, !compute_only),
         Command::Run {
             exe,
             unimplemented,

@@ -34,3 +34,6 @@ diagnostics = [
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_Memory"] }

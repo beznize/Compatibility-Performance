@@ -77,7 +77,7 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
-    /// Reason → programs stopped by it, and the first one.
+    /// Reason Ã¢â€ â€™ programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
@@ -315,39 +315,68 @@ pub fn run(
 }
 
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
-pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, graphics: bool) -> Result<()> {
+    use victory_hle::modules::d3d12x::audit;
     let paths = crate::default_paths(paths)?;
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let external = Mutex::new(crate::pack_warm::External::default());
+    let mut packs = Vec::new();
     let seen = Mutex::new(HashSet::new());
-    let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
+    let [done, refused, made, unmade, unsupported] = [const { AtomicUsize::new(0) }; 5];
     let started = std::time::Instant::now();
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !scan_file(&entry) {
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = match entry { Ok(entry) => entry, Err(error) => {
+                audit::event("scan", "missing", "-", &error);
+                eprintln!("warm: {error}");
+                continue;
+            }};
+            if entry.file_type().is_dir() { continue; }
+            if entry.file_type().is_symlink() && entry.path().is_dir() {
+                audit::event("scan", "skipped", "-", format_args!("linked directory: {}", entry.path().display()));
                 continue;
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
+            let data = match crate::archive::Archive::open(entry.path()) { Ok(bytes) => bytes, Err(error) => {
+                audit::event("scan", "missing", "-", format_args!("{}: {error}", entry.path().display()));
+                eprintln!("warm: cannot read {}: {error}", entry.path().display());
                 continue;
-            };
-            let jobs = sources(&data);
+            }};
+            if audit::enabled() { audit::event("scan", "opened", "-", format_args!("{} {}", data.len(), entry.path().display())); }
+            let jobs = crate::shader::sources_checked(&data, |reason, offset| {
+                if audit::enabled() { audit::event("scan", reason, "-", format_args!("{} {offset:#x}", entry.path().display())); }
+            });
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let Some(bytes) = job.bytes() else { continue };
-                            let Ok(container) = Container::parse(&bytes) else { continue };
+                            let miss = |why: &str| {
+                                if audit::enabled() { audit::event("scan", "skipped", "-", format_args!("{} {} {why}", entry.path().display(), job.label())); }
+                            };
+                            let Some(bytes) = job.bytes() else { miss("could not unpack candidate"); continue };
+                            let Ok(container) = Container::parse(&bytes) else { miss("invalid container"); continue };
                             // As the title passes it: no more than the container.
-                            let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
+                            let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { miss("incomplete container header"); continue };
                             let total = u32::from_le_bytes(total) as usize;
                             let bytes = &bytes[..total.min(bytes.len())];
-                            let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
-                            if !lock(&seen).insert(blake3::hash(bytes)) {
+                            let digest = blake3::hash(bytes);
+                            if !lock(&seen).insert(digest) {
                                 continue;
                             }
-                            let Ok(programs) = native_programs(dxil) else { continue };
+                            let skipped = |reason: &str| {
+                                unsupported.fetch_add(1, Ordering::Relaxed);
+                                if audit::enabled() {
+                                    audit::event("offline-shader", "unimplemented", &digest.to_hex(),
+                                        format_args!("{} {} {reason}", entry.path().display(), job.label()));
+                                }
+                            };
+                            let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { skipped("no DXIL part"); continue };
+                            let Ok(programs) = native_programs(dxil) else { skipped("native program decode failed"); continue };
+                            if pipelines && graphics {
+                                lock(&external).remember(bytes, &programs);
+                            }
                             let stage = programs.iter().find_map(|p| match p.stage {
                                 HwStage::Vs => Some("vertex"),
                                 HwStage::Ps => Some("pixel"),
@@ -355,9 +384,20 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 HwStage::Cs => Some("compute"),
                                 _ => None,
                             });
-                            let Some(stage) = stage else { continue };
+                            let Some(stage) = stage else {
+                                let stages: Vec<_> = programs.iter().map(|p| p.stage).collect();
+                                skipped(&format!("no implemented native stage {stages:?}"));
+                                continue
+                            };
+                            if audit::enabled() {
+                                audit::event("offline-shader", "discovered", &digest.to_hex(),
+                                    format_args!("{stage} {}", job.label()));
+                            }
                             let compute = pipelines && stage == "compute";
                             let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
+                            if audit::enabled() {
+                                audit::event("offline-shader", if translated { "translated" } else { "rejected" }, &digest.to_hex(), stage);
+                            }
                             let count = if translated { &done } else { &refused };
                             let n = count.fetch_add(1, Ordering::Relaxed) + 1;
                             match pipeline {
@@ -372,9 +412,22 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                     });
                 }
             });
+            if pipelines && graphics {
+                for (offset, pack) in victory_game::shaderpack::find_all(&data, |at| {
+                    audit::event("scan", "invalid_pack_signature", "-", format_args!("{} {at:#x}", entry.path().display()));
+                }) {
+                    audit::event("scan", "pack", "-", format_args!("{} {offset:#x}", entry.path().display()));
+                    packs.push((entry.path().to_owned(), pack.into_owned()));
+                }
+            }
         }
     }
+    for (path, pack) in packs {
+        let archive = crate::archive::Archive::open(&path)?;
+        crate::pack_warm::warm(&archive, &pack, &lock(&external), true, threads)?;
+    }
     victory_hle::modules::d3d12x::save_pipeline_cache();
+    println!("inventory    {} additional unique containers have no translatable native program", unsupported.into_inner());
     println!(
         "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
         done.into_inner(),

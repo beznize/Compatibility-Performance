@@ -36,10 +36,10 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
-    made: OnceLock<Option<HostPipeline>>,
+    made: OnceLock<Result<HostPipeline, String>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
-    key: String,
+    pub(super) key: String,
     used: AtomicBool,
     /// Why it is not made, if it is not ([`left_out`]).
     left_out: Option<&'static str>,
@@ -109,7 +109,9 @@ impl Pending {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        if !matches!(shaders.as_slice(), [cs] if cs.stage == "compute") {
+            key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        }
         let left_out = left_out(&shaders);
         Pending {
             shaders,
@@ -134,10 +136,29 @@ impl Pending {
         self.begun.get().is_some_and(|at| held_too_long(at.elapsed(), self.computes(), wait_budget()))
     }
 
+    pub(super) fn describe_request(&self, source: &str, origin: impl std::fmt::Display) {
+        if !super::audit::enabled() { return; }
+        let stages = self.shaders.iter().map(|s| format!("{}={}", s.stage, s.identity))
+            .collect::<Vec<_>>().join(",");
+        super::audit::event(source, "requested", &self.key, format_args!("{origin} {stages}"));
+        if let Some(reason) = self.left_out {
+            super::audit::event(source, "skipped", &self.key, reason);
+        }
+    }
+
+    fn compile(&self, source: &str) -> Result<HostPipeline, String> {
+        let result = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        match &result {
+            Ok(_) => super::audit::event(source, "created", &self.key, ""),
+            Err(why) => super::audit::event(source, "rejected", &self.key, why),
+        }
+        result
+    }
+
     fn make(&self) {
         let _ = self.begun.set(Instant::now());
         self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+            .get_or_init(|| self.compile("runtime"));
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -149,24 +170,12 @@ impl Pending {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
-        Some(Some(_)) => None,
+        Some(Ok(_)) => None,
         None => Some(p.left_out.map_or_else(
             || format!("being made {:?}", p.shaders),
             str::to_owned,
         )),
-        Some(None) => {
-            let failed: Vec<String> = p
-                .shaders
-                .iter()
-                .filter(|s| matches!(s.translated.get(), Some(None)))
-                .map(|s| format!("{} {}", s.stage, s.hash))
-                .collect();
-            Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
-            } else {
-                failed.join(" + ")
-            })
-        }
+        Some(Err(why)) => Some(format!("{why} {:?}", p.shaders)),
     }
 }
 
@@ -278,7 +287,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    if p.made.get().is_none() {
+        super::audit::event("runtime", "pending", &p.key, "binding deadline");
+    }
+    p.made.get()?.as_ref().ok()
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -288,17 +300,17 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
         return false;
     }
     p.make();
-    p.made.get().is_some_and(|made| made.is_some())
+    p.made.get().is_some_and(|made| made.is_ok())
 }
 
 /// Translates the containers of compute programs and makes their host
 /// pipelines, for the caches on disk; whether it has one (`None`: left out).
-pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
-    let p = Pending::new(shaders, None);
+pub(super) fn warm(p: Pending, source: &str, origin: impl std::fmt::Display) -> Option<bool> {
+    p.describe_request(source, origin);
     if p.left_out.is_some() {
         return None;
     }
-    Some(HostPipeline::new(&p.shaders, None).is_some())
+    Some(p.compile(source).is_ok())
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -693,7 +705,7 @@ mod tests {
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
-        assert!(matches!(p.made.get(), Some(None)));
+        assert!(matches!(p.made.get(), Some(Err(_))));
     }
 
     #[test]
